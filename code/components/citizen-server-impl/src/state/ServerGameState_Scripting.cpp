@@ -150,7 +150,32 @@ static void Init()
 		context.SetResult(true);
 	});
 
-#if _DEBUG 
+	// ihatemylife-128 (dev): CREATE_FAKE_PLAYER(clientNetId, x, y, z) -> entity script handle.
+	// Gives the fake client identified by clientNetId a synced player entity at (x,y,z).
+	fx::ScriptEngine::RegisterNativeHandler("CREATE_FAKE_PLAYER", [](fx::ScriptContext& context)
+	{
+		auto resourceManager = fx::ResourceManager::GetCurrent();
+		auto instance = resourceManager->GetComponent<fx::ServerInstanceBaseRef>()->Get();
+		auto gameState = instance->GetComponent<fx::ServerGameState>();
+		auto clientRegistry = instance->GetComponent<fx::ClientRegistry>();
+
+		auto netId = context.GetArgument<uint32_t>(0);
+		float x = context.GetArgument<float>(1);
+		float y = context.GetArgument<float>(2);
+		float z = context.GetArgument<float>(3);
+
+		auto client = clientRegistry->GetClientByNetID(netId);
+		if (!client)
+		{
+			context.SetResult<uint32_t>(0);
+			return;
+		}
+
+		auto entity = gameState->CreateFakePlayerEntity(client, x, y, z);
+		context.SetResult<uint32_t>(entity ? gameState->MakeScriptHandle(entity) : 0);
+	});
+
+#if _DEBUG
 	fx::ScriptEngine::RegisterNativeHandler("IS_ENTITY_RELEVANT", [](fx::ScriptContext& context)
 	{
 		// get the current resource manager

@@ -8,7 +8,7 @@ static constexpr const size_t kGamePlayerCap =
 #ifdef STATE_FIVE
 128
 #elif defined(STATE_RDR3)
-32
+128 // ihatemylife-128 / PR #3477: RDR3 128-player support (was 32)
 #endif
 ;
 
@@ -1509,6 +1509,9 @@ public:
 	void ClearClientFromWorldGrid(const fx::ClientSharedPtr& targetClient);
 
 	fx::sync::SyncEntityPtr CreateEntityFromTree(sync::NetObjEntityType type, const std::shared_ptr<sync::SyncTreeBase>& tree);
+
+	// ihatemylife-128
+	fx::sync::SyncEntityPtr CreateFakePlayerEntity(const fx::ClientSharedPtr& client, float x, float y, float z);
 
 	inline EntityLockdownMode GetEntityLockdownMode()
 	{

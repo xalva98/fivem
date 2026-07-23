@@ -731,6 +731,13 @@ struct CPlayerAppearanceDataNode
 
 		return true;
 	}
+
+	bool Unparse(sync::SyncUnparseState& state)
+	{
+		state.buffer.Write<uint32_t>(32, model);
+
+		return true;
+	}
 };
 
 struct CPlayerPedGroupDataNode { };
@@ -760,10 +767,20 @@ struct CPlayerSectorPosNode
 		m_posX = posX;
 		m_posY = posY;
 		m_posZ = posZ;
-	
+
 		// ...
 
 		state.entity->syncTree->CalculatePosition();
+
+		return true;
+	}
+
+	bool Unparse(sync::SyncUnparseState& state)
+	{
+		rl::MessageBuffer& buffer = state.buffer;
+		buffer.WriteFloat(12, 54.0f, m_posX);
+		buffer.WriteFloat(12, 54.0f, m_posY);
+		buffer.WriteFloat(12, 69.0f, m_posZ);
 
 		return true;
 	}
@@ -829,6 +846,23 @@ struct CPlayerCameraDataNode
 		}
 
 		// TODO
+
+		return true;
+	}
+
+	// minimal serialize for server-created (fake) players: writes the simplest
+	// well-formed camera node (no free-cam, no position offset, camMode 0) with
+	// the stored look angles. Enough for a stationary synced player.
+	bool Unparse(sync::SyncUnparseState& state)
+	{
+		rl::MessageBuffer& buffer = state.buffer;
+
+		buffer.WriteBit(false); // not freeCamOverride
+		buffer.WriteBit(false); // hasPositionOffset = false
+		buffer.WriteBit(false); // (second bit read after hasPositionOffset)
+
+		buffer.WriteSignedFloat(10, 6.2831855f, data.cameraX);
+		buffer.WriteSignedFloat(10, 6.2831855f, data.cameraZ);
 
 		return true;
 	}

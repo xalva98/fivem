@@ -43,6 +43,17 @@ namespace fx
 
 	bool Client::IsDead()
 	{
+		// FAKE CLIENT (ihatemylife-128, never upstream): socketless fake clients have no
+		// ENet peer and no real connection to time out. Never reap them, so the fake
+		// population stays STABLE (otherwise they die at CLIENT_DEAD_TIMEOUT and churn).
+		{
+			auto fake = GetData("fakeClient");
+			if (fake && fx::AnyCast<bool>(fake))
+			{
+				return false;
+			}
+		}
+
 		// if we've not connected yet, we can't be dead
 		if (!HasConnected())
 		{
@@ -69,6 +80,16 @@ namespace fx
 
 	int Client::GetPing()
 	{
+		// FAKE CLIENT (ihatemylife-128, never upstream): no ENet peer -> peer->GetPing()
+		// would deref a wrapper with no real handle; return a sane fake ping instead.
+		{
+			auto fake = GetData("fakeClient");
+			if (fake && fx::AnyCast<bool>(fake))
+			{
+				return 1;
+			}
+		}
+
 		fx::NetPeerStackBuffer stackBuffer;
 		gscomms_get_peer(GetPeer(), stackBuffer);
 		auto peer = stackBuffer.GetBase();

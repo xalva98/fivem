@@ -167,6 +167,11 @@ public:
 		}
 	}
 
+	virtual const std::map<int, rage::netObject*>& GetPlayerObjects(uint8_t playerId) override
+	{
+		return m_netObjects[playerId];
+	}
+
 	void HandleCloneSync(const char* data, size_t len) override;
 	void HandleCloneAcks(const char* data, size_t len) override;
 
@@ -396,7 +401,7 @@ void CloneManagerLocal::BindNetLibrary(NetLibrary* netLibrary)
 	})
 	.detach();
 
-	static ConVar<std::string> logFile("onesync_logFile", ConVar_UserPref, "", &m_logFile);
+	static ConVar<std::string> logFile("onesync_logFile", ConVar_None, "", &m_logFile);
 
 	static ConsoleCommand printObj("net_printOwner", [this](int objectId)
 	{
@@ -1006,7 +1011,7 @@ bool CloneManagerLocal::HandleCloneCreate(const msgClone& msg)
 	// owner ID (forced to be remote so we can call ChangeOwner later)
 	auto isRemote = true;
 	auto owner = 31;
-
+	
 	// create the object
 	auto obj = rage::CreateCloneObject(msg.GetEntityType(), msg.GetObjectId(), owner, 0, 32);
 
@@ -1383,31 +1388,6 @@ void CloneManagerLocal::HandleCloneSync(const char* data, size_t len)
 	FrameIndex newIndex(msg.GetFrameIndex());
 
 	Log("received frame %d:%d\n", newIndex.frameIndex, newIndex.currentFragment);
-
-	if (m_lastReceivedFrame.frameIndex != 0)
-	{
-		bool isStale = false;
-
-		if (newIndex.frameIndex < m_lastReceivedFrame.frameIndex)
-		{
-			// received an older frame, out of order
-			isStale = true;
-		}
-		else if (newIndex.frameIndex == m_lastReceivedFrame.frameIndex
-			&& newIndex.currentFragment <= m_lastReceivedFrame.currentFragment)
-		{
-			// same frame but older or duplicate fragment
-			isStale = true;
-		}
-
-		if (isStale)
-		{
-			Log("Ignoring stale out-of-order packet (frame %d:%d, last received %d:%d)\n",
-				newIndex.frameIndex, newIndex.currentFragment,
-				m_lastReceivedFrame.frameIndex, m_lastReceivedFrame.currentFragment);
-			return;
-		}
-	}
 
 	// blah
 	if (m_lastReceivedFrame.frameIndex != 0)

@@ -2,6 +2,7 @@
 #include <GameServer.h>
 
 #include <state/ServerGameState.h>
+#include <state/SyncTrees.h> // ihatemylife-128: concrete node types for CreateFakePlayerEntity
 
 #include <optional>
 #include <charconv>
@@ -1651,9 +1652,9 @@ void ServerGameState::Tick(fx::ServerInstanceBase* instance)
 
 							if (!hasCreatedPlayer)
 							{
-								constexpr const int kSlotIdStart = 
+								constexpr const int kSlotIdStart =
 #ifdef STATE_RDR3
-									30
+									127 // ihatemylife-128 / PR #3477: 128-player (was 30)
 #else
 									127
 #endif
@@ -3333,6 +3334,167 @@ auto ServerGameState::CreateEntityFromTree(sync::NetObjEntityType type, const st
 	return entity;
 }
 
+// RDR3-only: the fake-player path references RDR3 player nodes / Unparse methods.
+#ifdef STATE_RDR3
+static std::string g_fakePlayerModel = "mp_male";
+static ConVar<std::string> g_fakePlayerModelVar("fake_player_model", ConVar_None, "mp_male", &g_fakePlayerModel);
+
+// raw create-clone bytes captured from a real player; fakes replay them.
+std::mutex g_capturedPlayerCloneMutex;
+std::vector<uint8_t> g_capturedPlayerClone;
+uint16_t g_capturedPlayerCloneLength = 0;
+
+// fill+serialize one node in the player sync tree, replicating ServerSetters.cpp's
+// SetupNode/UnparseTo (FIVE-only). GetNode lives on the concrete tree, cast first.
+template<typename TNode, typename TFn>
+static void FakeSetupNode(const std::shared_ptr<sync::SyncTreeBase>& baseTree, TFn fn)
+{
+	auto tree = std::static_pointer_cast<sync::CPlayerSyncTree>(baseTree);
+	auto n = tree->template GetNode<TNode>();
+	fn(n->node);
+
+	rl::MessageBuffer mb(n->data.size());
+	sync::SyncUnparseState state{ mb };
+	n->node.Unparse(state);
+
+	memcpy(n->data.data(), mb.GetBuffer().data(), mb.GetBuffer().size());
+	n->length = mb.GetCurrentBit();
+
+	n->frameIndex = 12;
+	n->timestamp = msec().count();
+}
+
+auto ServerGameState::CreateFakePlayerEntity(const fx::ClientSharedPtr& client, float x, float y, float z) -> fx::sync::SyncEntityPtr
+{
+	// allocate an object id (same scan as CreateEntityFromTree)
+	int id = fx::IsLengthHack() ? (MaxObjectId - 1) : 8191;
+	{
+		bool valid = false;
+		std::unique_lock objectIdsLock(m_objectIdsMutex);
+		for (; id >= 1; id--)
+		{
+			if (!m_objectIdsSent.test(id) && !m_objectIdsUsed.test(id))
+			{
+				valid = true;
+				break;
+			}
+		}
+		if (!valid)
+		{
+			return {};
+		}
+		m_objectIdsSent.set(id);
+		m_objectIdsUsed.set(id);
+		m_objectIdsStolen.set(id);
+	}
+
+	// construct the entity owned by the fake client (mirrors ProcessClonePacket create-block)
+	fx::sync::SyncEntityPtr entity = fx::sync::SyncEntityPtr::Construct();
+	entity->GetFirstOwnerUnsafe() = client;
+	entity->GetClientUnsafe() = client;
+	entity->type = sync::NetObjEntityType::Player;
+	entity->frameIndex = m_frameIndex;
+	entity->lastFrameIndex = 0;
+	entity->handle = MakeEntityHandle(id);
+	entity->uniqifier = rand();
+	entity->creationToken = msec().count();
+	entity->createdAt = msec();
+	entity->passedFilter = true;
+	entity->syncTree = MakeSyncTree(sync::NetObjEntityType::Player);
+	entity->lastReceivedAt = msec();
+	entity->timestamp = msec().count();
+
+	if (!entity->syncTree)
+	{
+		return {};
+	}
+
+	{
+		auto data = GetClientDataUnlocked(this, client);
+		entity->routingBucket = data->routingBucket;
+	}
+
+	auto tree = entity->syncTree;
+
+	// replay a real player's captured create-clone into this tree, then patch position.
+	{
+		std::vector<uint8_t> templateBytes;
+		{
+			std::lock_guard _(g_capturedPlayerCloneMutex);
+			templateBytes = g_capturedPlayerClone;
+		}
+
+		if (templateBytes.empty())
+		{
+			return {};
+		}
+
+		sync::SyncParseStateDynamic state{ { templateBytes }, 1 /* create */, 0, (uint32_t)msec().count(), entity, m_frameIndex };
+		tree->ParseCreate(state);
+	}
+
+	// patch position onto the replayed tree (12-bit sector-relative, matching Parse)
+	int sectorX = int((x / 54.0f) + 512.0f);
+	int sectorY = int((y / 54.0f) + 512.0f);
+	int sectorZ = int((z + 1700.0f) / 69.0f);
+	float sectorPosX = x - ((sectorX - 512.0f) * 54.0f);
+	float sectorPosY = y - ((sectorY - 512.0f) * 54.0f);
+	float sectorPosZ = z - ((sectorZ * 69.0f) - 1700.0f);
+
+	FakeSetupNode<sync::CSectorDataNode>(tree, [sectorX, sectorY, sectorZ](sync::CSectorDataNode& n)
+	{
+		n.m_sectorX = sectorX;
+		n.m_sectorY = sectorY;
+		n.m_sectorZ = sectorZ;
+	});
+
+	FakeSetupNode<sync::CPlayerSectorPosNode>(tree, [sectorPosX, sectorPosY, sectorPosZ](sync::CPlayerSectorPosNode& n)
+	{
+		n.m_posX = sectorPosX;
+		n.m_posY = sectorPosY;
+		n.m_posZ = sectorPosZ;
+		n.isStandingOn = false;
+	});
+
+	tree->CalculatePosition();
+
+	// NOTE: re-serializing CPlayerAppearanceDataNode via FakeSetupNode to change the
+	// model BROKE ped creation on the client (ped=no for every model) - it reshuffled
+	// the create packet enough that the client rejected the player ped. Instead we
+	// SURGICALLY overwrite just the 4 model-hash bytes in the captured template BEFORE
+	// ParseCreate (see the capture-replay block above), leaving the byte-perfect clone
+	// otherwise intact. That preserves everything the client needs to build the ped.
+
+	// register in the entity lists
+	{
+		std::unique_lock<std::shared_mutex> entityListLock(m_entityListMutex);
+		m_entityList.insert(entity);
+	}
+	{
+		std::unique_lock entitiesByIdLock(m_entitiesByIdMutex);
+		m_entitiesById[id] = entity;
+	}
+
+	// player linkage: this entity becomes the client's player (mirrors ProcessClonePacket)
+	{
+		auto data = GetClientDataUnlocked(this, client);
+		std::unique_lock _lock(data->playerEntityMutex);
+		SendWorldGrid(nullptr, client);
+		client->OnCreatePed();
+		data->playerEntity = entity;
+		client->SetData("playerEntity", MakeScriptHandle(entity));
+	}
+
+	return entity;
+}
+#else
+// Five build: fake players are RDR3-only; provide a no-op so the declaration links.
+auto ServerGameState::CreateFakePlayerEntity(const fx::ClientSharedPtr& client, float x, float y, float z) -> fx::sync::SyncEntityPtr
+{
+	return {};
+}
+#endif
+
 bool ServerGameState::ProcessClonePacket(const fx::ClientSharedPtr& client, rl::MessageBufferView& inPacket, int parsingType, uint16_t* outObjectId, uint16_t* outUniqifier)
 {
 	auto playerId = 0;
@@ -3379,6 +3541,21 @@ bool ServerGameState::ProcessClonePacket(const fx::ClientSharedPtr& client, rl::
 	{
 		inPacket.ReadBits(&bitBytes[0], bitBytes.size() * 8);
 	}
+
+#ifdef STATE_RDR3
+	// capture-and-replay: save a REAL player's create-clone as the fake template
+	if (parsingType == 1 && objectType == sync::NetObjEntityType::Player && length > 0)
+	{
+		auto fake = client->GetData("fakeClient");
+		if (!fake || !fx::AnyCast<bool>(fake))
+		{
+			std::lock_guard _(g_capturedPlayerCloneMutex);
+			g_capturedPlayerClone.assign(bitBytes.begin(), bitBytes.end());
+			g_capturedPlayerCloneLength = length;
+			console::Printf("fakeclients", "captured real player clone template (%d bytes) - fakes will replay it.\n", length);
+		}
+	}
+#endif
 
 	// that's not an object ID, that's a snail!
 	if (objectId == 0xFFFF)
@@ -7865,7 +8042,7 @@ static InitFunction initFunction([]()
 
 		constexpr bool canLengthHack =
 #ifdef STATE_RDR3
-		false
+		true // ihatemylife-128 / PR #3477: 128-player (was false)
 #else
 		true
 #endif
